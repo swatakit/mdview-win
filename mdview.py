@@ -8,9 +8,12 @@ the plain text is shown.
 """
 import hashlib
 import html
+import json
 import pathlib
+import re
 import sys
 import tempfile
+import urllib.parse
 import webbrowser
 
 CSS = """
@@ -65,12 +68,51 @@ if (window.mermaid) {
 """
 
 
-def main():
-    if len(sys.argv) < 2:
-        return
-    src = pathlib.Path(sys.argv[1]).resolve()
-    text = src.read_text(encoding="utf-8-sig", errors="replace")
+LINKS = """
+<script>
+(function () {
+  var map = __MAP__;
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var u;
+    try { u = new URL(a.href); } catch (e) { return; }
+    var hash = u.hash;
+    u.hash = '';
+    var key;
+    try { key = decodeURIComponent(u.href).toLowerCase(); } catch (e) { return; }
+    if (map[key]) a.href = map[key] + hash;
+  });
+})();
+</script>
+"""
 
+MAX_FILES = 200
+LINK_RE = re.compile(
+    r"""(?:\]\(\s*<?|href\s*=\s*["']|^\s*\[[^\]]+\]:\s*<?)([^)\s>"'#]+\.(?:md|markdown))""",
+    re.I | re.M)
+OUT_DIR = pathlib.Path(tempfile.gettempdir()) / "mdview"
+
+
+def out_path(src):
+    tag = hashlib.md5(str(src).encode("utf-8")).hexdigest()[:8]
+    return OUT_DIR / f"{src.stem}-{tag}.html"
+
+
+def linked_files(src, text):
+    """Local .md files that this file links to (existing ones only)."""
+    found = []
+    for target in LINK_RE.findall(text):
+        if re.match(r"[a-z][a-z0-9+.-]+:", target, re.I):
+            continue  # http:, mailto:, file: ... (a one-letter prefix is a drive)
+        try:
+            path = (src.parent / urllib.parse.unquote(target)).resolve()
+            if path.is_file() and path not in found:
+                found.append(path)
+        except OSError:
+            pass
+    return found
+
+
+def render(src, text, links):
     try:
         import markdown
         body = markdown.markdown(
@@ -80,19 +122,44 @@ def main():
         body = '<pre id="raw">' + html.escape(text) + "</pre>"
         scripts = MARKED + MERMAID
 
-    page = (
+    link_map = {urllib.parse.unquote(p.as_uri()).lower(): out_path(p).as_uri()
+                for p in links}
+    scripts += LINKS.replace(
+        "__MAP__", json.dumps(link_map).replace("</", "<\\/"))
+
+    return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         f"<title>{html.escape(src.name)}</title>"
         f"<base href='{src.parent.as_uri()}/'>"
         f"<style>{CSS}</style></head><body>{body}{scripts}</body></html>"
     )
 
-    out_dir = pathlib.Path(tempfile.gettempdir()) / "mdview"
-    out_dir.mkdir(exist_ok=True)
-    tag = hashlib.md5(str(src).encode("utf-8")).hexdigest()[:8]
-    out = out_dir / f"{src.stem}-{tag}.html"
-    out.write_text(page, encoding="utf-8")
-    webbrowser.open(out.as_uri())
+
+def main():
+    if len(sys.argv) < 2:
+        return
+    first = pathlib.Path(sys.argv[1]).resolve()
+    OUT_DIR.mkdir(exist_ok=True)
+
+    # Render the opened file plus every local .md it links to (each once),
+    # so links between pages open rendered copies instead of raw text.
+    queue, seen = [first], {first}
+    while queue:
+        src = queue.pop(0)
+        try:
+            text = src.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            if src == first:
+                raise
+            continue
+        links = linked_files(src, text)
+        for path in links:
+            if path not in seen and len(seen) < MAX_FILES:
+                seen.add(path)
+                queue.append(path)
+        out_path(src).write_text(render(src, text, links), encoding="utf-8")
+
+    webbrowser.open(out_path(first).as_uri())
 
 
 if __name__ == "__main__":
